@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,10 +50,11 @@ class JobStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            yield conn
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -128,21 +131,20 @@ class JobStore:
             ).fetchall()
         return [JobRecord(**dict(row)) for row in rows]
 
-    def update(self, job_id: str, **values: Any) -> JobRecord:
+    def update(
+        self, job_id: str, *, expected_statuses: tuple[str, ...] = (), **values: Any
+    ) -> JobRecord:
         values["updated_at"] = now_iso()
-        if not values:
-            record = self.get(job_id)
-            if record is None:
-                raise KeyError(job_id)
-            return record
         assignments = ", ".join(f"{key} = ?" for key in values)
+        parameters = [*values.values(), job_id]
+        condition = "id = ?"
+        if expected_statuses:
+            placeholders = ", ".join("?" for _ in expected_statuses)
+            condition += f" AND status IN ({placeholders})"
+            parameters.extend(expected_statuses)
         with self._connect() as conn:
-            conn.execute(
-                f"UPDATE jobs SET {assignments} WHERE id = ?",
-                [*values.values(), job_id],
-            )
-        record = self.get(job_id)
-        if record is None:
+            conn.execute(f"UPDATE jobs SET {assignments} WHERE {condition}", parameters)
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
             raise KeyError(job_id)
-        return record
-
+        return JobRecord(**dict(row))

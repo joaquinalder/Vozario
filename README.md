@@ -40,7 +40,14 @@ Abrí [localhost:8000](http://localhost:8000/). Completá `VOZARIO_S3_BUCKET` y 
 
 ## Pruebas y contenedor
 
-`python -m unittest discover -s tests -v` comprueba el parser de resultados de Transcribe, el formato SRT y la validación de formatos. Estas pruebas se ejecutan sin llamar a AWS.
+Instalá las dependencias de pruebas y ejecutá la suite.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Además del parser y del formato SRT, la suite prueba el flujo HTTP con SQLite temporal y un AWS simulado. Las pruebas no requieren credenciales ni generan cargos.
 
 El [Dockerfile](Dockerfile) empaqueta la aplicación en el puerto 8000. Para conservar el historial entre reemplazos del contenedor, montá almacenamiento persistente y configurá `VOZARIO_SQLITE_PATH` dentro de ese volumen.
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from .config import Settings
 from .database import JobRecord, now_iso
 
@@ -190,7 +192,12 @@ class AwsTranscribeService:
             request["LanguageCode"] = record.language_code
         if record.speaker_labels:
             request["Settings"] = {"ShowSpeakerLabels": True, "MaxSpeakerLabels": 6}
-        transcribe.start_transcription_job(**request)
+        try:
+            transcribe.start_transcription_job(**request)
+        except ClientError as exc:
+            # A retry uses the same UUID-based job name as the original request.
+            if exc.response["Error"]["Code"] != "ConflictException":
+                raise
 
     def refresh_transcription(self, record: JobRecord) -> dict[str, Any]:
         transcribe = self._client("transcribe")

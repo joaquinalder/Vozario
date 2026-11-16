@@ -59,7 +59,9 @@ async function api(path, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.detail || "No se pudo completar la accion.");
+    const error = new Error(payload.detail || "No se pudo completar la accion.");
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -170,7 +172,7 @@ function syncTranscript() {
   }
 }
 
-async function pollJob(jobId) {
+async function pollJob(jobId, retries = 0) {
   clearTimeout(state.pollTimer);
   try {
     const { job } = await api(`/api/jobs/${jobId}`);
@@ -187,6 +189,11 @@ async function pollJob(jobId) {
       setProgress(0, job.failureReason || "El trabajo fallo.");
     }
   } catch (error) {
+    if (error.status === 502 && retries < 3) {
+      setProgress(100, "No se pudo consultar el estado. Volviendo a intentar…");
+      state.pollTimer = setTimeout(() => pollJob(jobId, retries + 1), 5000);
+      return;
+    }
     setProgress(0, error.message);
   }
 }

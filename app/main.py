@@ -5,7 +5,9 @@ import re
 import uuid
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,7 +19,9 @@ from .config import settings
 from .database import JobRecord, JobStore
 
 
-APP_ROOT = PurePosixPath(__file__).parent
+AWS_ERRORS = (BotoCoreError, ClientError, RuntimeError)
+PENDING_UPLOAD = ("waiting_upload", "queued")
+ACTIVE_TRANSCRIPTION = ("queued", "processing")
 
 app = FastAPI(title="Vozario Web", version="1.0.0")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -62,9 +66,9 @@ def record_to_api(record: JobRecord) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
+        request=request,
+        name="index.html",
+        context={
             "max_upload_mb": settings.max_upload_mb,
             "has_bucket": bool(settings.s3_bucket),
         },
@@ -92,6 +96,11 @@ def sign_upload(payload: SignUploadRequest) -> dict[str, Any]:
     title = payload.title.strip()[:140] or safe_title(payload.filename)
     language_code = payload.language_code if payload.language_code != "auto" else "es-ES"
 
+    try:
+        upload_url = aws.presigned_upload_url(media_key, payload.content_type)
+    except AWS_ERRORS as exc:
+        raise HTTPException(status_code=502, detail="No se pudo preparar la subida.") from exc
+
     record = store.create(
         id=job_id,
         title=title,
@@ -107,10 +116,6 @@ def sign_upload(payload: SignUploadRequest) -> dict[str, Any]:
         size_bytes=payload.size_bytes,
         transcribe_job_name=job_name,
     )
-    try:
-        upload_url = aws.presigned_upload_url(media_key, payload.content_type)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {
         "job": record_to_api(record),
         "uploadUrl": upload_url,
@@ -119,17 +124,21 @@ def sign_upload(payload: SignUploadRequest) -> dict[str, Any]:
 
 
 @app.post("/api/jobs/{job_id}/start")
-def start_job(job_id: str, _: StartJobRequest) -> dict[str, Any]:
+def start_job(job_id: str, payload: StartJobRequest) -> dict[str, Any]:
     record = _get_job(job_id)
-    if record.status not in {"waiting_upload", "failed"}:
+    if record.status not in PENDING_UPLOAD:
         return {"job": record_to_api(record)}
-    record = store.update(job_id, status="queued", failure_reason="")
+    if not payload.uploaded:
+        raise HTTPException(status_code=409, detail="El archivo todavía no se subió.")
+
     try:
         aws.start_transcription(record)
-    except Exception as exc:
-        record = store.update(job_id, status="failed", failure_reason=str(exc))
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    record = store.update(job_id, status="processing")
+    except AWS_ERRORS as exc:
+        raise HTTPException(status_code=502, detail="No se pudo iniciar la transcripción.") from exc
+
+    record = store.update(
+        job_id, expected_statuses=PENDING_UPLOAD, status="processing", failure_reason=""
+    )
     return {"job": record_to_api(record)}
 
 
@@ -141,7 +150,7 @@ def list_jobs() -> dict[str, Any]:
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     record = _get_job(job_id)
-    if record.status in {"queued", "processing"}:
+    if record.status in ACTIVE_TRANSCRIPTION:
         record = _refresh(record)
     return {"job": record_to_api(record)}
 
@@ -151,8 +160,8 @@ def media_url(job_id: str) -> dict[str, str]:
     record = _get_job(job_id)
     try:
         return {"url": aws.presigned_media_url(record.s3_media_key)}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except AWS_ERRORS as exc:
+        raise HTTPException(status_code=502, detail="No se pudo abrir el archivo.") from exc
 
 
 @app.get("/api/jobs/{job_id}/download.txt", response_class=PlainTextResponse)
@@ -160,7 +169,7 @@ def download_text(job_id: str) -> PlainTextResponse:
     record = _get_job(job_id)
     return PlainTextResponse(
         record.transcript_text or "",
-        headers={"Content-Disposition": f'attachment; filename="{record.title}.txt"'},
+        headers={"Content-Disposition": _attachment(record.title, "txt")},
     )
 
 
@@ -169,7 +178,7 @@ def download_srt(job_id: str) -> PlainTextResponse:
     record = _get_job(job_id)
     return PlainTextResponse(
         make_srt(record.segments),
-        headers={"Content-Disposition": f'attachment; filename="{record.title}.srt"'},
+        headers={"Content-Disposition": _attachment(record.title, "srt")},
     )
 
 
@@ -181,12 +190,13 @@ def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 def _refresh(record: JobRecord) -> JobRecord:
     try:
         refresh = aws.refresh_transcription(record)
-    except Exception as exc:
-        return store.update(record.id, status="failed", failure_reason=str(exc))
+    except (BotoCoreError, ClientError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="No se pudo consultar la transcripción.") from exc
     if refresh["status"] == "completed":
         result = refresh["result"]
         return store.update(
             record.id,
+            expected_statuses=ACTIVE_TRANSCRIPTION,
             status="completed",
             transcript_text=result.text,
             transcript_json=result.raw_json,
@@ -197,10 +207,11 @@ def _refresh(record: JobRecord) -> JobRecord:
     if refresh["status"] == "failed":
         return store.update(
             record.id,
+            expected_statuses=ACTIVE_TRANSCRIPTION,
             status="failed",
             failure_reason=refresh.get("failure_reason", "Amazon Transcribe fallo."),
         )
-    return store.update(record.id, status="processing")
+    return record
 
 
 def _get_job(job_id: str) -> JobRecord:
@@ -215,3 +226,7 @@ def _safe_key_name(filename: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip(".-")
     return name[:180] or "video.mp4"
 
+
+def _attachment(title: str, extension: str) -> str:
+    name = quote(f"{title}.{extension}", safe="")
+    return f"attachment; filename=\"transcripcion.{extension}\"; filename*=UTF-8''{name}"
